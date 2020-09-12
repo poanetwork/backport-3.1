@@ -144,6 +144,17 @@ impl Transaction {
             s.append(&0u8);
         }
     }
+
+    pub fn decode_rlp(d: &Rlp) -> Result<Transaction, DecoderError> {
+        Ok(Transaction {
+            nonce: d.val_at(0)?,
+            gas_price: d.val_at(1)?,
+            gas: d.val_at(2)?,
+            action: d.val_at(3)?,
+            value: d.val_at(4)?,
+            data: d.val_at(5)?,
+        })
+    }
 }
 
 impl HeapSizeOf for Transaction {
@@ -194,6 +205,7 @@ impl From<ethjson::transaction::Transaction> for UnverifiedTransaction {
             s: t.s.into(),
             v: t.v.into(),
             hash: 0.into(),
+            tx_type: TransactionType::Legacy, //TODO check this
         }
         .compute_hash()
     }
@@ -223,6 +235,7 @@ impl Transaction {
             s: sig.s().into(),
             v: signature::add_chain_replay_protection(sig.v() as u64, chain_id),
             hash: 0.into(),
+            tx_type: TransactionType::Legacy,
         }
         .compute_hash()
     }
@@ -236,6 +249,7 @@ impl Transaction {
             s: U256::one(),
             v: 0,
             hash: 0.into(),
+            tx_type: TransactionType::Legacy,
         }
         .compute_hash()
     }
@@ -249,6 +263,7 @@ impl Transaction {
                 s: U256::one(),
                 v: 0,
                 hash: 0.into(),
+                tx_type: TransactionType::Legacy,
             }
             .compute_hash(),
             sender: from,
@@ -268,10 +283,75 @@ impl Transaction {
                 s: U256::zero(),
                 v: chain_id,
                 hash: 0.into(),
+                tx_type: TransactionType::LegacyNewFormat,
             }
             .compute_hash(),
             sender: UNSIGNED_SENDER,
             public: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TransactionSubType {
+    First, // an optional additional signature from which the account that will pay for gas (GAS_PAYER) can be recovered
+    Second,   // multiple transactions from the same sender that will be executed in sequence
+    Third,  // an optional validUntil field that makes the transaction invalid after a certain point in time
+    Fourth,
+}
+
+// [1, ChildTransaction[], nonce, ChainId, ValidUntil, gasLimit, gasPrice]
+// [2, ChildTransaction[], nonce, ChainId, ValidUntil, gasLimit, gasPrice]
+// [3, ChildTransaction[], nonce, ChainId, ValidUntil, gasLimit]
+// [4, ChildTransaction[], nonce, ChainId, ValidUntil]
+
+impl TransactionSubType {
+    pub fn new(subtype: u8) -> TransactionSubType {
+        match subtype {
+            0x01 => Self::First,
+            0x02 => Self::Second,
+            0x03 => Self::Third,
+            0x04 => Self::Fourth,
+        }
+    }
+    pub fn TransactionSubType(&self) -> u8 {
+        match self {
+            Self::First => 0x01,
+            Self::Second => 0x02,
+            Self::Third => 0x03,
+            Self::Fourth => 0x04,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TransactionType {
+    Unknown,
+    Legacy,
+    LegacyNewFormat,
+    LegacyNewFormat02,
+    SubType(TransactionSubType),
+}
+
+impl TransactionType {
+    pub fn new(header: u8) -> TransactionType {
+        if header & 0x80 == 0x80 {
+            Self::Legacy
+        } else {
+            match header {
+                0x00 => Self::LegacyNewFormat,
+                0x01 => Self::LegacyNewFormat02,
+                0x02 => Self::SubType(TransactionSubType::Unknown),
+                _ => Self::Unknown,
+            }
+        }
+    }
+    pub fn to_byte(&self) -> u8 {
+        match self {
+            Self::Legacy => 0xFF,
+            Self::LegacyNewFormat => 0x00,
+            Self::LegacyNewFormat02 => 0x01,
+            Self::Unknown => panic!(),
         }
     }
 }
@@ -290,6 +370,8 @@ pub struct UnverifiedTransaction {
     s: U256,
     /// Hash of the transaction
     hash: H256,
+    /// Type of transaction included in EIP-2718
+    tx_type: TransactionType,
 }
 
 impl HeapSizeOf for UnverifiedTransaction {
@@ -308,37 +390,20 @@ impl Deref for UnverifiedTransaction {
 
 impl rlp::Decodable for UnverifiedTransaction {
     fn decode(d: &Rlp) -> Result<Self, DecoderError> {
-        if d.item_count()? != 9 {
-            return Err(DecoderError::RlpIncorrectListLen);
-        }
-        let hash = keccak(d.as_raw());
-        Ok(UnverifiedTransaction {
-            unsigned: Transaction {
-                nonce: d.val_at(0)?,
-                gas_price: d.val_at(1)?,
-                gas: d.val_at(2)?,
-                action: d.val_at(3)?,
-                value: d.val_at(4)?,
-                data: d.val_at(5)?,
-            },
-            v: d.val_at(6)?,
-            r: d.val_at(7)?,
-            s: d.val_at(8)?,
-            hash,
-        })
+        UnverifiedTransaction::decode(d.as_raw())
     }
 }
 
 impl rlp::Encodable for UnverifiedTransaction {
     fn rlp_append(&self, s: &mut RlpStream) {
-        self.rlp_append_sealed_transaction(s)
+        self.encode_rlp(s)
     }
 }
 
 impl UnverifiedTransaction {
     /// Used to compute hash of created transactions
     fn compute_hash(mut self) -> UnverifiedTransaction {
-        let hash = keccak(&*self.rlp_bytes());
+        let hash = keccak(&*self.encode());
         self.hash = hash;
         self
     }
@@ -348,18 +413,97 @@ impl UnverifiedTransaction {
         self.r.is_zero() && self.s.is_zero()
     }
 
+    pub fn encode(&self) -> Vec<u8> {
+        vec![]
+    }
+
+    fn decode_rlp(d: &Rlp) -> Result<UnverifiedTransaction, DecoderError> {
+        if d.item_count()? != 9 {
+            return Err(DecoderError::RlpIncorrectListLen);
+        }
+        let hash = keccak(d.as_raw());
+        Ok(UnverifiedTransaction {
+            unsigned: Transaction::decode_rlp(d)?,
+            v: d.val_at(6)?,
+            r: d.val_at(7)?,
+            s: d.val_at(8)?,
+            tx_type: TransactionType::Legacy,
+            hash,
+        })
+    }
+
+    /// ommited | 8bytes | 32bytes | 32bytes| 8bytes | RLP
+    /// 0x00 || yParity || r || s || 0x65000000 || rlp(nonce, gasPrice, gasLimit, to, value, data)
+    /// 0x01 || yParity || r || s || 0x65000000 || rlp(nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0)
+    fn decode_01(
+        tx: &[u8],
+        tx_type: TransactionType,
+    ) -> Result<UnverifiedTransaction, DecoderError> {
+        if tx.len() > 82 {
+            return Err(DecoderError::RlpIsTooShort);
+        }
+        if tx[67..75] != [0x65, 0x00, 0x00, 0x00] {
+            return Err(DecoderError::Custom("Expected 0x65000000 in transaction"));
+        }
+        Ok(UnverifiedTransaction {
+            v: tx[2] as u64,
+            r: U256::from(&tx[3..35]),
+            s: U256::from(&tx[35..67]),
+            unsigned: Transaction::decode_rlp(&Rlp::new(&tx[75..]))?,
+            tx_type: tx_type,
+            hash: keccak(tx),
+        })
+    }
+
+    pub fn decode(transaction: &[u8]) -> Result<UnverifiedTransaction, DecoderError> {
+        let tx_type = TransactionType::new(transaction[0]); //get header and deduce if it is legacy RLP transaction or new EIP-2718
+        match tx_type {
+            TransactionType::Legacy => Self::decode_rlp(&Rlp::new(&transaction)),
+            TransactionType::LegacyNewFormat => Self::decode_01(transaction, tx_type),
+            _ => Err(DecoderError::Custom("Expected 0x65000000 in transaction")),
+        }
+    }
+
     /// Append object with a signature into RLP stream
-    fn rlp_append_sealed_transaction(&self, s: &mut RlpStream) {
-        s.begin_list(9);
-        s.append(&self.nonce);
-        s.append(&self.gas_price);
-        s.append(&self.gas);
-        s.append(&self.action);
-        s.append(&self.value);
-        s.append(&self.data);
-        s.append(&self.v);
-        s.append(&self.r);
-        s.append(&self.s);
+    fn encode_rlp(&self, s: &mut RlpStream) {
+        match self.tx_type {
+            TransactionType::Legacy => {
+                s.begin_list(9);
+                s.append(&self.nonce);
+                s.append(&self.gas_price);
+                s.append(&self.gas);
+                s.append(&self.action);
+                s.append(&self.value);
+                s.append(&self.data);
+                s.append(&self.v);
+                s.append(&self.r);
+                s.append(&self.s);
+                s.append(&self.s);
+            }
+            TransactionType::LegacyNewFormat => {
+                let mut buffer: Vec<u8> = Vec::with_capacity(120);
+                let mut r_butes: [u8; 32] = [0; 32];
+                let mut s_bytes: [u8; 32] = [0; 32];
+
+                self.r.to_big_endian(&mut r_butes);
+                self.s.to_big_endian(&mut s_bytes);
+
+                buffer.push(self.tx_type.to_byte());
+                buffer.push(self.v as u8);
+                buffer.extend_from_slice(&r_butes);
+                buffer.extend_from_slice(&s_bytes);
+                buffer.extend_from_slice(&[0x65, 0x00, 0x00, 0x00]);
+
+                let mut stream = RlpStream::new();
+                self.rlp_append_unsigned_transaction(&mut stream, None); //TODO dr fix chainId
+                buffer.extend_from_slice(&stream.out());
+
+                s.append(&buffer);
+            }
+
+            TransactionType::Unknown => {}
+            TransactionType::LegacyNewFormat02 => {}
+        }
     }
 
     ///	Reference to unsigned part of this transaction.
@@ -450,7 +594,7 @@ impl HeapSizeOf for SignedTransaction {
 
 impl rlp::Encodable for SignedTransaction {
     fn rlp_append(&self, s: &mut RlpStream) {
-        self.transaction.rlp_append_sealed_transaction(s)
+        self.transaction.encode_rlp(s)
     }
 }
 
@@ -585,11 +729,13 @@ mod tests {
     use ethereum_types::U256;
     use hash::keccak;
 
+    //TODO CREATE TESTS FOR UnverifiedTransaction
+
     #[test]
     fn sender_test() {
         let bytes = ::rustc_hex::FromHex::from_hex("f85f800182520894095e7baea6a6c7c4c2dfeb977efac326af552d870a801ba048b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353a0efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804").unwrap();
         let t: UnverifiedTransaction =
-            rlp::decode(&bytes).expect("decoding UnverifiedTransaction failed");
+            UnverifiedTransaction::decode(&bytes).expect("decoding UnverifiedTransaction failed");
         assert_eq!(t.data, b"");
         assert_eq!(t.gas, U256::from(0x5208u64));
         assert_eq!(t.gas_price, U256::from(0x01u64));
@@ -694,6 +840,8 @@ mod tests {
         }
         .null_sign(1);
 
+        println!("transaction {:?}",t);
+
         let res = SignedTransaction::new(t.transaction);
         match res {
             Err(ethkey::Error::InvalidSignature) => {}
@@ -723,8 +871,9 @@ mod tests {
         use rustc_hex::FromHex;
 
         let test_vector = |tx_data: &str, address: &'static str| {
-            let signed =
-                rlp::decode(&FromHex::from_hex(tx_data).unwrap()).expect("decoding tx data failed");
+            let signed = UnverifiedTransaction::decode(&FromHex::from_hex(tx_data).unwrap())
+                .expect("decoding tx data failed");
+            println!("v:{}",signed.v);
             let signed = SignedTransaction::new(signed).unwrap();
             assert_eq!(signed.sender(), address.into());
             println!("chainid: {:?}", signed.chain_id());
